@@ -1,0 +1,6 @@
+goos: linux
+goarch: amd64
+pkg: mybenchmark
+cpu: 11th Gen Intel(R) Core(TM) i7-1185G7 @ 3.00GHz
+BenchmarkWhileLoopWithSimpleCondition-8   	1000000000	         0.9073 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWhileLoopWithAtomicRead-8        	1000000000	         0.4415 ns/op	       0 B/op	       0 allocs/op
