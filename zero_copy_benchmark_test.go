@@ -173,7 +173,11 @@ func BenchmarkSendfileLargeFile(b *testing.B) {
 	}
 }
 
-// BenchmarkTraditionalCopyFileToSocket benchmarks traditional read/write for comparison
+// BenchmarkTraditionalCopyFileToSocket benchmarks traditional read/write for comparison.
+// NOTE: This is NOT a true traditional benchmark. io.CopyBuffer calls dst.ReadFrom(src)
+// when dst implements io.ReaderFrom (net.TCPConn does), which on Linux uses sendfile
+// internally — the provided buf is ignored. See BenchmarkFileTransferThroughput for a
+// true 2-copy baseline using explicit Read+Write.
 func BenchmarkTraditionalCopyFileToSocket(b *testing.B) {
 	tmpFile, tmpPath := createTempFileWithData(b, 64*1024)
 	defer os.Remove(tmpPath)
@@ -627,4 +631,103 @@ func BenchmarkVmspliceVsTraditional(b *testing.B) {
 			unix.Write(pipeFds[1], data)
 		}
 	})
+}
+
+// BenchmarkFileTransferThroughput measures MB/s for file-to-socket transfer at multiple
+// sizes. "Traditional" is the true 2-copy baseline (file→userspace buf→socket via explicit
+// Read+Write). "Sendfile" is the zero-copy path (file→NIC via sendfile syscall, 0 CPU copies).
+// b.SetBytes enables Go to report MB/s alongside ns/op.
+func BenchmarkFileTransferThroughput(b *testing.B) {
+	sizes := []struct {
+		name string
+		size int
+	}{
+		{"4KB", 4 * 1024},
+		{"64KB", 64 * 1024},
+		{"1MB", 1024 * 1024},
+	}
+
+	for _, tc := range sizes {
+		tc := tc
+
+		// Traditional: explicit Read into userspace buffer then Write to socket.
+		// This forces 2 CPU copies: kernel page cache → userspace, userspace → socket buffer.
+		// io.Copy / io.CopyBuffer must NOT be used here because net.TCPConn implements
+		// io.ReaderFrom which redirects to sendfile on Linux, bypassing userspace entirely.
+		b.Run("Traditional/"+tc.name, func(b *testing.B) {
+			tmpFile, tmpPath := createTempFileWithData(b, tc.size)
+			defer os.Remove(tmpPath)
+			defer tmpFile.Close()
+
+			listener, serverConn, clientConn := setupTCPConnection(b)
+			defer listener.Close()
+			defer serverConn.Close()
+			defer clientConn.Close()
+
+			go func() {
+				io.Copy(io.Discard, serverConn)
+			}()
+
+			buf := make([]byte, 32*1024)
+			b.SetBytes(int64(tc.size))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := tmpFile.Seek(0, 0); err != nil {
+					b.Fatal(err)
+				}
+				// Explicit Read+Write loop: forces 2 CPU copies through userspace.
+				for {
+					n, err := tmpFile.Read(buf)
+					if n > 0 {
+						if _, werr := clientConn.Write(buf[:n]); werr != nil {
+							b.Fatal(werr)
+						}
+					}
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+
+		// Sendfile: zero-copy path. The kernel moves data directly from the file's page
+		// cache to the NIC descriptor without any CPU copy through userspace.
+		b.Run("Sendfile/"+tc.name, func(b *testing.B) {
+			tmpFile, tmpPath := createTempFileWithData(b, tc.size)
+			defer os.Remove(tmpPath)
+			defer tmpFile.Close()
+
+			listener, serverConn, clientConn := setupTCPConnection(b)
+			defer listener.Close()
+			defer serverConn.Close()
+			defer clientConn.Close()
+
+			go func() {
+				io.Copy(io.Discard, serverConn)
+			}()
+
+			clientFile, err := clientConn.(*net.TCPConn).File()
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer clientFile.Close()
+
+			clientFd := int(clientFile.Fd())
+			fileFd := int(tmpFile.Fd())
+
+			b.SetBytes(int64(tc.size))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := tmpFile.Seek(0, 0); err != nil {
+					b.Fatal(err)
+				}
+				if _, err := unix.Sendfile(clientFd, fileFd, nil, tc.size); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }

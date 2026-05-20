@@ -1,3 +1,5 @@
+//go:build mph
+
 package mybenchmark
 
 import (
